@@ -1,0 +1,26 @@
+{
+  "name": "opencode-win-notifier",
+  "version": "1.0.0",
+  "description": "Minimal Windows desktop notification plugin for opencode — native toast when the agent finishes, errors, or asks for permission. Zero dependencies, zero network, zero disk writes.",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "author": "zhangenze0419",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhangenze0419/opencode-win-notifier.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "windows",
+    "notification",
+    "toast",
+    "desktop"
+  ],
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ]
+}
