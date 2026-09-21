@@ -5,10 +5,10 @@
   "type": "module",
   "main": "index.js",
   "license": "MIT",
-  "author": "zhangenze0419",
+  "author": "0to1-labs",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zhangenze0419/opencode-win-notifier.git"
+    "url": "git+https://github.com/0to1-labs/opencode-win-notifier.git"
   },
   "keywords": [
     "opencode",
