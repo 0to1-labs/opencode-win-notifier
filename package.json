@@ -1,7 +1,7 @@
 {
   "name": "opencode-win-notifier",
-  "version": "1.0.0",
-  "description": "Minimal Windows desktop notification plugin for opencode — native toast when the agent finishes, errors, or asks for permission. Zero dependencies, zero network, zero disk writes.",
+  "version": "1.2.0",
+  "description": "Windows desktop notification plugin for opencode — dual-path (WinRT Toast + Popup dialog) when the agent finishes, errors, or asks for permission. Zero dependencies, zero network, zero disk writes.",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
