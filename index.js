@@ -1,55 +1,42 @@
-// opencode win-notifier v3.0.0 — Windows desktop notification plugin for opencode
+// opencode win-notifier v3.0.4 — Windows desktop notification plugin for opencode
 //
-// v3.0.0: rewritten for the opencode v2 plugin format.
-//   - Exports a v2 plugin definition: default export { id, setup } via
-//     @opencode-ai/plugin/v2/promise define().
-//   - Listens on the v2 event stream (context.event.subscribe, consumed with
-//     for-await — it is an async iterable, not callback-based):
-//       session.execution.succeeded (v1 "session.idle") -> task finished card
-//       session.execution.failed / session.error            -> error card
-//       permission.asked / permission.v2.asked              -> approval card
-//   - v2 events carry their payload in `properties` (session.* events) or
-//     `data` (aggregate events) — both are handled.
-//   - Notification core unchanged from v2.0.0: WinRT toast (Notification
-//     Center history) + custom WPF glass card (slide-in bottom-right, hover
-//     pauses countdown, click dismisses, never steals focus).
-//   - Subagent (child) sessions are filtered via parentID; rapid duplicate
-//     idles are debounced; unknown sessions still notify (prefer a stray
-//     popup over a missing one).
+// v3.0.4: THE fix — removed `detached: true` from spawn. The opencode embedded
+//   Bun runtime does not execute the command of detached child processes on
+//   Windows (verified via a 6-variant spawn matrix: every detached combo
+//   failed to execute; the only non-detached combo executed). This also
+//   explains the plugin's on-and-off history since v1.x.
+//
+// v3.0.3: WPF card swapped for a WScript.Shell Popup (WPF windows are
+//   suppressed by the windowsHide spawn flag's STARTF_USESHOWWINDOW/SW_HIDE).
+//
+// v3.0.1: event stream consumed with for-await (async iterable); v2 event
+//   names: session.execution.succeeded / session.execution.failed /
+//   permission.asked.
+//
+// Notification surfaces (both fire together):
+//   1. WinRT toast  — lands in the Notification Center (history)
+//   2. WScript.Shell Popup — a real dialog window, always visible, 8s timeout
 //
 // Security: zero dependencies, zero network, zero disk writes, single transparent file.
-// NOTE: no imports needed — the v2 plugin definition is a plain default-exported
-// object ({ id, setup }); define() from @opencode-ai/plugin/v2/promise is an
-// identity helper, so we skip it to stay dependency-free.
 
 import { spawn } from "node:child_process";
 
 // ---------- config ----------
 
-const DEBOUNCE_MS = 3000;      // merge duplicate session.idle within this window
-const CARD_DURATION_MS = 6000; // card stays on screen before fading out
+const DEBOUNCE_MS = 3000; // merge duplicate completion events within this window
 
 const CARDS = {
   idle: {
     title: "任务完成",
     message: "OpenCode 已回答完毕，回来看看吧",
-    glyph: 0x2713, // ✓
-    accent: "#2EA043",
-    sound: "asterisk",
   },
   error: {
     title: "出错了",
     message: "会话发生错误，需要你处理",
-    glyph: 0x2715, // ✕
-    accent: "#D73A49",
-    sound: "hand",
   },
   permission: {
     title: "等待授权",
     message: "OpenCode 需要你的批准才能继续",
-    glyph: 0x26A0, // ⚠
-    accent: "#D29922",
-    sound: "exclamation",
   },
 };
 
@@ -57,7 +44,7 @@ const CARDS = {
 
 // sid -> { child: boolean, title: string|null }
 const sessions = new Map();
-// sid -> last idle notification timestamp
+// sid -> last completion notification timestamp
 const lastIdleAt = new Map();
 
 // ---------- powershell plumbing ----------
@@ -72,9 +59,16 @@ function sanitize(text) {
 
 function spawnPowerShell(psScript) {
   try {
-    spawn("powershell.exe", ["-NoProfile", "-STA", "-EncodedCommand", toEncodedCommand(psScript)], {
-      detached: true, stdio: "ignore", windowsHide: true,
-    }).unref();
+    // CRITICAL: do NOT use `detached: true` — the opencode embedded Bun
+    // runtime does not execute detached children on Windows. A non-detached
+    // child survives the parent fine here (the server is long-lived, and the
+    // notification processes exit on their own within seconds).
+    const child = spawn("powershell.exe", ["-NoProfile", "-EncodedCommand", toEncodedCommand(psScript)], {
+      stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    });
+    child.stdout?.on("data", () => {});
+    child.stderr?.on("data", () => {});
+    child.unref();
   } catch { /* best-effort */ }
 }
 
@@ -95,124 +89,25 @@ function notifyToast(title, message) {
   spawnPowerShell(ps);
 }
 
-// ---------- path 2: WPF card (the fancy one) ----------
+// ---------- path 2: WScript.Shell Popup (guaranteed visible) ----------
+// A real dialog window via COM — completely independent of WPF ShowWindow
+// behavior and of all Windows notification settings.
 
-const CARD_PS = `
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-
-$cfg = @'
-__JSON__
-'@ | ConvertFrom-Json
-
-$xamlText = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True"
-        Background="Transparent" Topmost="True" ShowInTaskbar="False"
-        ShowActivated="False" Width="380" Height="116">
-  <Border x:Name="Card" CornerRadius="14" Padding="18,14" Margin="18" Cursor="Hand">
-    <Border.Background>
-      <SolidColorBrush Color="#F216181D" />
-    </Border.Background>
-    <Border.Effect>
-      <DropShadowEffect BlurRadius="20" ShadowDepth="3" Opacity="0.5" />
-    </Border.Effect>
-    <StackPanel Orientation="Horizontal">
-      <Grid Width="42" Height="42">
-        <Ellipse Fill="__ACCENT__" />
-        <TextBlock x:Name="Glyph" Foreground="White" FontSize="19" FontWeight="Bold"
-                   HorizontalAlignment="Center" VerticalAlignment="Center" />
-      </Grid>
-      <StackPanel Margin="16,0,0,0" VerticalAlignment="Center" Width="262">
-        <TextBlock x:Name="Title" Foreground="White" FontSize="14.5" FontWeight="SemiBold" />
-        <TextBlock x:Name="Message" Foreground="#C8FFFFFF" FontSize="12" TextWrapping="Wrap"
-                   Margin="0,4,0,0" TextTrimming="CharacterEllipsis" />
-        <TextBlock x:Name="Stamp" Foreground="#59FFFFFF" FontSize="10.5" Margin="0,7,0,0" />
-      </StackPanel>
-    </StackPanel>
-  </Border>
-</Window>
-'@
-$xamlText = $xamlText.Replace('__ACCENT__', $cfg.accent)
-$reader = New-Object System.Xml.XmlNodeReader ([xml]$xamlText)
-$win = [Windows.Markup.XamlReader]::Load($reader)
-
-$win.FindName('Glyph').Text = [char]::ConvertFromUtf32([int]$cfg.glyph)
-$win.FindName('Title').Text = $cfg.title
-$win.FindName('Message').Text = $cfg.message
-$win.FindName('Stamp').Text = $cfg.stamp
-
-$work = [System.Windows.SystemParameters]::WorkArea
-$win.Left = $work.Right - $win.Width - 14
-$win.Top = $work.Bottom - $win.Height - 14
-$win.Opacity = 0
-
-$script:slide = New-Object System.Windows.Media.TranslateTransform($win.Width, 0)
-# NOTE: a top-level WPF Window does not support RenderTransform (it is an HWND),
-# so the slide-in animation is applied to the card content Border instead.
-$win.FindName('Card').RenderTransform = $slide
-
-$win.Add_ContentRendered({
-  try {
-    switch ($cfg.sound) {
-      'exclamation' { [System.Media.SystemSounds]::Exclamation.Play() }
-      'hand'        { [System.Media.SystemSounds]::Hand.Play() }
-      default       { [System.Media.SystemSounds]::Asterisk.Play() }
-    }
-  } catch {}
-  $fadeIn = New-Object System.Windows.Media.Animation.DoubleAnimation(0, 1, [TimeSpan]::FromMilliseconds(260))
-  $win.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fadeIn)
-  $ease = New-Object System.Windows.Media.Animation.CubicEase
-  $ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
-  $anim = New-Object System.Windows.Media.Animation.DoubleAnimation($win.Width, 0, [TimeSpan]::FromMilliseconds(380))
-  $anim.EasingFunction = $ease
-  $script:slide.BeginAnimation([System.Windows.Media.TranslateTransform]::XProperty, $anim)
-})
-
-$script:done = $false
-$script:dismiss = {
-  if ($script:done) { return }
-  $script:done = $true
-  $script:timer.Stop()
-  $out = New-Object System.Windows.Media.Animation.DoubleAnimation(1, 0, [TimeSpan]::FromMilliseconds(260))
-  $out.Add_Completed({ $win.Close() })
-  $win.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $out)
-}
-
-$script:timer = New-Object System.Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromMilliseconds($cfg.duration)
-$timer.Add_Tick({ & $script:dismiss })
-$timer.Start()
-
-$win.Add_MouseEnter({ $script:timer.Stop() })
-$win.Add_MouseLeave({ $script:timer.Start() })
-$win.Add_MouseLeftButtonDown({ & $script:dismiss })
-
-$app = New-Object System.Windows.Application
-$app.ShutdownMode = [System.Windows.ShutdownMode]::OnLastWindowClose
-$app.Run($win) | Out-Null
-`;
-
-function notifyCard(card, stampText) {
-  const cfg = JSON.stringify({
-    title: card.title,
-    message: card.message,
-    glyph: card.glyph,
-    accent: card.accent,
-    sound: card.sound,
-    duration: CARD_DURATION_MS,
-    stamp: stampText,
-  }).replace(/'/g, "''");
-  const ps = CARD_PS.replace("__JSON__", cfg);
+function notifyPopup(title, message) {
+  const t = sanitize(title).replace(/"/g, "");
+  const m = sanitize(message).replace(/"/g, "");
+  const ps = [
+    `$ws = New-Object -ComObject WScript.Shell;`,
+    `$ws.Popup('${m}', 8, '${t}', 64) | Out-Null;`,
+  ].join(" ");
   spawnPowerShell(ps);
 }
 
 // ---------- notify ----------
 
 function notify(card, stampText) {
-  notifyToast(card.title, card.message); // Notification Center history
-  notifyCard(card, stampText);           // on-screen card
+  notifyToast(card.title, card.message);                           // Notification Center history
+  notifyPopup(card.title, card.message + "  (" + stampText + ")"); // always-visible dialog
 }
 
 // ---------- event helpers ----------
@@ -238,6 +133,58 @@ function stampNow() {
   return h + ":" + m;
 }
 
+// ---------- event handling ----------
+
+function handleEvent(event) {
+  const type = event?.type;
+  const sid = eventSID(event);
+
+  if (type === "session.created" && sid) {
+    const info = eventInfo(event);
+    sessions.set(sid, {
+      child: Boolean(info?.parentID),
+      title: info?.title || null,
+    });
+    return;
+  }
+
+  if (type === "session.renamed" && sid) {
+    const info = sessions.get(sid);
+    const newTitle = event?.properties?.title ?? event?.data?.title ?? null;
+    if (info) info.title = newTitle || info.title;
+    return;
+  }
+
+  if (type === "session.deleted" && sid) {
+    sessions.delete(sid);
+    lastIdleAt.delete(sid);
+    return;
+  }
+
+  if (type === "session.idle" || type === "session.execution.succeeded") {
+    const info = sid ? sessions.get(sid) : null;
+    if (info?.child) return; // subagent finished — not worth interrupting you
+
+    const now = Date.now();
+    if (sid && now - (lastIdleAt.get(sid) ?? 0) < DEBOUNCE_MS) return;
+    if (sid) lastIdleAt.set(sid, now);
+
+    const card = { ...CARDS.idle };
+    if (info?.title) card.message = "「" + info.title + "」已回答完毕";
+    notify(card, stampNow());
+    return;
+  }
+
+  if (type === "session.error" || type === "session.execution.failed") {
+    notify(CARDS.error, stampNow());
+    return;
+  }
+
+  if (type === "permission.asked" || type === "permission.v2.asked") {
+    notify(CARDS.permission, stampNow());
+  }
+}
+
 // ---------- plugin (opencode v2 format) ----------
 
 export default {
@@ -253,54 +200,3 @@ export default {
     })().catch(() => { /* stream ended or failed — nothing to do */ });
   },
 };
-
-function handleEvent(event) {
-      const type = event?.type;
-      const sid = eventSID(event);
-
-      if (type === "session.created" && sid) {
-        const info = eventInfo(event);
-        sessions.set(sid, {
-          child: Boolean(info?.parentID),
-          title: info?.title || null,
-        });
-        return;
-      }
-
-      if (type === "session.deleted" && sid) {
-        sessions.delete(sid);
-        lastIdleAt.delete(sid);
-        return;
-      }
-
-      if (type === "session.renamed" && sid) {
-        const info = sid ? sessions.get(sid) : null;
-        const newTitle = event?.properties?.title ?? event?.data?.title ?? null;
-        if (info) info.title = newTitle || info.title;
-        return;
-      }
-
-      if (type === "session.idle" || type === "session.execution.succeeded") {
-        const info = sid ? sessions.get(sid) : null;
-        if (info?.child) return; // subagent finished — not worth interrupting you
-
-        const now = Date.now();
-        if (sid && now - (lastIdleAt.get(sid) ?? 0) < DEBOUNCE_MS) return;
-        if (sid) lastIdleAt.set(sid, now);
-
-        const card = { ...CARDS.idle };
-        if (info?.title) card.message = "「" + info.title + "」已回答完毕";
-        notify(card, stampNow());
-        return;
-      }
-
-      if (type === "session.error" || type === "session.execution.failed") {
-        notify(CARDS.error, stampNow());
-        return;
-      }
-
-      if (type === "permission.asked" || type === "permission.v2.asked") {
-        notify(CARDS.permission, stampNow());
-      }
-}
-

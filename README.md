@@ -1,52 +1,36 @@
 # opencode-win-notifier
 
-**Windows desktop notification plugin for [opencode](https://opencode.ai) v2** — now with a custom WPF glass card.
+**Windows desktop notification plugin for [opencode](https://opencode.ai) v2.**
 
 Two notification surfaces fire together, zero dependencies, zero network calls, zero disk writes:
 
-1. **WPF card** — a borderless dark glass card slides in from the bottom-right corner:
-   - accent color / glyph / sound per event type (done ✓ green · error ✕ red · permission ⚠ amber)
-   - auto fade-out countdown, **hover pauses the countdown**, click anywhere to dismiss
-   - never steals keyboard focus
-2. **WinRT toast** — lands in the Notification Center so you keep a history
+1. **WinRT toast** — lands in the Notification Center so you keep a history
+2. **WScript.Shell popup** — a real dialog window that is always visible (8 s timeout), immune to Focus Assist, notification settings, and WPF window-visibility quirks
 
-> 中文一句话：opencode v2 的 Windows 桌面通知插件——AI 干完活、出错、等你批权限时，右下角滑入一张深色毛玻璃卡片（同时进通知中心）；无依赖、无网络、无落盘。
+> 中文一句话：opencode v2 的 Windows 桌面通知插件——AI 干完活、出错、等你批权限时弹系统通知和一个保证可见的对话框；无依赖、无网络、无落盘。
 
 ## What it does
 
-| Event | Card |
+| Event | Notification |
 |---|---|
-| `session.idle` | ✓ green — **任务完成** Task finished (shows session title when known) |
-| `permission.asked` | ⚠ amber — **等待授权** Your approval is needed |
-| `session.error` | ✕ red — **出错了** Something went wrong |
+| `session.execution.succeeded` | **任务完成** Task finished (shows session title when known) |
+| `permission.asked` | **等待授权** Your approval is needed |
+| `session.execution.failed` / `session.error` | **出错了** Something went wrong |
 
 Stop staring at the terminal while a long task runs — opencode will ping you on the desktop when it's done or needs you.
 
-## v3.0.1 — fixed the event stream consumption
+## v3.0.4 — the "sometimes it doesn't pop up" bug, finally root-caused
 
-v3.0.0 called `context.event.subscribe(callback)` assuming a callback API — but the v2
-`subscribe()` returns an **async iterable** (the callback was silently treated as an
-options object and dropped, so no events ever arrived). v3.0.1 consumes the stream
-with `for await...of` in a background loop.
+The full fix history of the v3 line (each step verified on a real Windows 11 + opencode 2.1 setup):
 
-Also switched to the actual v2 event names observed on the wire:
-`session.execution.succeeded` (generation finished, v1 `session.idle` never fires in v2),
-`session.execution.failed` (errors), plus `session.renamed` to pick up session titles.
-
-## v3.0.0 — rewritten for the opencode v2 plugin format
-
-opencode 2.1+ requires plugins in the `plugins/` discovery directory to be **v2-format modules**: a default-exported definition object with an `id` and a `setup` (or `effect`) function. The old "export an async function returning hooks" format (and the old `plugin` config array with file paths) is no longer loaded — that is why this plugin silently stopped working for many users after upgrading opencode.
-
-v3 is a native v2 plugin:
-
-- default-exports `{ id: "user.win-notifier", setup }` — no helper imports needed, still zero dependencies
-- subscribes to the v2 event stream (`context.event.subscribe`)
-- handles both `properties`-shaped and `data`-shaped v2 events
-- subagent (child) sessions are filtered via `parentID`, rapid duplicate idles are debounced, unknown sessions still notify — prefer a stray popup over a missing one
+- **v3.0.4 — removed `detached: true` from `spawn()`.** The opencode embedded Bun runtime does not execute the commands of detached child processes on Windows. Verified with a six-variant spawn matrix: every detached combination spawned a process that silently did nothing; the only non-detached variant executed. This is the true root cause of this plugin's flaky notifications since v1.x, and likely affects many other spawn-based opencode plugins on Windows.
+- **v3.0.3 — WPF card swapped for a WScript.Shell popup.** `windowsHide: true` sets `STARTF_USESHOWWINDOW/SW_HIDE` in STARTUPINFO, which is inherited by WPF windows spawned that way and keeps them invisible. Toasts and COM popups are immune.
+- **v3.0.1 — v2 event stream fixes.** `context.event.subscribe()` returns an async iterable (consume with `for await...of`, not a callback), and v2's real completion event is `session.execution.succeeded` (v1's `session.idle` never fires in v2).
+- **v3.0.0 — rewritten for the opencode v2 plugin format.** opencode 2.1+ no longer loads v1-format plugins (async function returning hooks) from the `plugins/` discovery directory or the old `plugin` config array.
 
 ## Install
 
-1. Put `index.js` into the global plugin discovery directory, e.g.:
+1. Put `index.js` into the global plugin discovery directory:
 
 ```
 ~/.config/opencode/plugins/win-notifier.js
@@ -54,7 +38,7 @@ v3 is a native v2 plugin:
 
 Windows example: `C:\Users\<you>\.config\opencode\plugins\win-notifier.js`
 
-opencode discovers `.js`/`.ts` files in `~/.config/opencode/plugins/` automatically at startup — **no config entry needed**. (Editing the file hot-reloads the plugin; no restart required on opencode 2.1+.)
+opencode discovers `.js`/`.ts` files in `~/.config/opencode/plugins/` automatically at startup — **no config entry needed**. (Editing the file hot-reloads the plugin; run `opencode service restart` to be safe.)
 
 2. Nothing else. No build, no npm install, no dependencies.
 
@@ -62,27 +46,28 @@ opencode discovers `.js`/`.ts` files in `~/.config/opencode/plugins/` automatica
 
 ## How it works
 
-- Exports a v2 plugin definition; `setup` subscribes to the event stream
-- On trigger, spawns **detached** `powershell.exe -NoProfile -STA -EncodedCommand` processes:
-  - one running a WinRT toast via `ToastNotificationManager`
-  - one rendering the WPF card (`PresentationFramework`) with slide-in / fade-out animations and a `DispatcherTimer` countdown
-- The command is UTF-16LE → base64 encoded, so it is immune to quoting/injection issues
-- Fire-and-forget (`unref` + detached): never blocks the agent loop, never crashes the session
-- Card text is passed as a single JSON blob (`ConvertFrom-Json`) — no string-injection surface
+- Exports a v2 plugin definition; `setup` consumes the event stream with `for await...of`
+- On trigger, spawns `powershell.exe -NoProfile -EncodedCommand` processes (UTF-16LE → base64, immune to quoting/injection):
+  - one firing a WinRT toast via `ToastNotificationManager`
+  - one showing a `WScript.Shell` COM popup
+- Spawn details matter on Windows:
+  - **no `detached: true`** — detached children don't execute under the embedded Bun runtime
+  - `stdio` uses pipes — a fully-ignored stdio prevents execution on some hosts
+  - outputs are drained to avoid pipe backpressure
+- Fire-and-forget (`unref`): never blocks the agent loop, never crashes the session
 
 ## Tuning
 
 Top of the file:
 
-- `CARD_DURATION_MS` — how long the card stays on screen (default 6000)
-- `DEBOUNCE_MS` — merge duplicate idle events within this window (default 3000)
-- `CARDS` — title / message / glyph / accent color / sound per event type (notification text is Chinese by default; edit freely)
+- `DEBOUNCE_MS` — merge duplicate completion events within this window (default 3000)
+- `CARDS` — title / message per event type (notification text is Chinese by default; edit freely)
+- The popup timeout (8 s) lives in `notifyPopup`
 
 ## Notes
 
 - Windows only (win32). On macOS/Linux you already have good options.
-- The card renders via WPF, so it works even when Focus Assist / notification banners are disabled; the toast companion requires Windows PowerShell not to be muted in Settings → System → Notifications.
-- Known limitation: simultaneous cards stack on top of each other (no cross-process positioning yet).
+- The toast companion requires Windows PowerShell not to be muted in Settings → System → Notifications.
 
 ## License
 
