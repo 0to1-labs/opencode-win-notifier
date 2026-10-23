@@ -22,6 +22,17 @@ Two notification surfaces fire together, zero dependencies, zero network calls, 
 
 Stop staring at the terminal while a long task runs — opencode will ping you on the desktop when it's done or needs you.
 
+## v3.0.1 — fixed the event stream consumption
+
+v3.0.0 called `context.event.subscribe(callback)` assuming a callback API — but the v2
+`subscribe()` returns an **async iterable** (the callback was silently treated as an
+options object and dropped, so no events ever arrived). v3.0.1 consumes the stream
+with `for await...of` in a background loop.
+
+Also switched to the actual v2 event names observed on the wire:
+`session.execution.succeeded` (generation finished, v1 `session.idle` never fires in v2),
+`session.execution.failed` (errors), plus `session.renamed` to pick up session titles.
+
 ## v3.0.0 — rewritten for the opencode v2 plugin format
 
 opencode 2.1+ requires plugins in the `plugins/` discovery directory to be **v2-format modules**: a default-exported definition object with an `id` and a `setup` (or `effect`) function. The old "export an async function returning hooks" format (and the old `plugin` config array with file paths) is no longer loaded — that is why this plugin silently stopped working for many users after upgrading opencode.

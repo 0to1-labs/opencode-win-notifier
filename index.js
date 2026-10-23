@@ -3,10 +3,11 @@
 // v3.0.0: rewritten for the opencode v2 plugin format.
 //   - Exports a v2 plugin definition: default export { id, setup } via
 //     @opencode-ai/plugin/v2/promise define().
-//   - Listens on the v2 event stream (context.event.subscribe):
-//       session.idle   -> task finished card (green check)
-//       session.error  -> error card (red cross)
-//       permission.asked / permission.v2.asked -> approval card (amber warning)
+//   - Listens on the v2 event stream (context.event.subscribe, consumed with
+//     for-await — it is an async iterable, not callback-based):
+//       session.execution.succeeded (v1 "session.idle") -> task finished card
+//       session.execution.failed / session.error            -> error card
+//       permission.asked / permission.v2.asked              -> approval card
 //   - v2 events carry their payload in `properties` (session.* events) or
 //     `data` (aggregate events) — both are handled.
 //   - Notification core unchanged from v2.0.0: WinRT toast (Notification
@@ -242,7 +243,18 @@ function stampNow() {
 export default {
   id: "user.win-notifier",
   setup: async (context) => {
-    await context.event.subscribe((event) => {
+    // context.event.subscribe() returns an async iterable of events — consume
+    // it with for-await in a background loop (setup must not block).
+    const stream = await context.event.subscribe();
+    (async () => {
+      for await (const event of stream) {
+        try { handleEvent(event); } catch { /* best-effort */ }
+      }
+    })().catch(() => { /* stream ended or failed — nothing to do */ });
+  },
+};
+
+function handleEvent(event) {
       const type = event?.type;
       const sid = eventSID(event);
 
@@ -261,7 +273,14 @@ export default {
         return;
       }
 
-      if (type === "session.idle") {
+      if (type === "session.renamed" && sid) {
+        const info = sid ? sessions.get(sid) : null;
+        const newTitle = event?.properties?.title ?? event?.data?.title ?? null;
+        if (info) info.title = newTitle || info.title;
+        return;
+      }
+
+      if (type === "session.idle" || type === "session.execution.succeeded") {
         const info = sid ? sessions.get(sid) : null;
         if (info?.child) return; // subagent finished — not worth interrupting you
 
@@ -275,7 +294,7 @@ export default {
         return;
       }
 
-      if (type === "session.error") {
+      if (type === "session.error" || type === "session.execution.failed") {
         notify(CARDS.error, stampNow());
         return;
       }
@@ -283,6 +302,5 @@ export default {
       if (type === "permission.asked" || type === "permission.v2.asked") {
         notify(CARDS.permission, stampNow());
       }
-    });
-  },
-};
+}
+
