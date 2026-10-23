@@ -1,74 +1,77 @@
 # opencode-win-notifier
 
-Minimal **Windows desktop notification plugin for [opencode](https://opencode.ai)**.
+**Windows desktop notification plugin for [opencode](https://opencode.ai) v2** — now with a custom WPF glass card.
 
-Fires a native Windows toast when your agent needs you — **zero dependencies, zero network calls, zero disk writes**. One transparent ~50-line file you can read in a minute.
+Two notification surfaces fire together, zero dependencies, zero network calls, zero disk writes:
 
-> 中文一句话:opencode 的 Windows 桌面通知插件——AI 干完活、出错、等你批权限时弹系统气泡;无依赖、无网络、无落盘,单文件透明代码。
+1. **WPF card** — a borderless dark glass card slides in from the bottom-right corner:
+   - accent color / glyph / sound per event type (done ✓ green · error ✕ red · permission ⚠ amber)
+   - auto fade-out countdown, **hover pauses the countdown**, click anywhere to dismiss
+   - never steals keyboard focus
+2. **WinRT toast** — lands in the Notification Center so you keep a history
+
+> 中文一句话：opencode v2 的 Windows 桌面通知插件——AI 干完活、出错、等你批权限时，右下角滑入一张深色毛玻璃卡片（同时进通知中心）；无依赖、无网络、无落盘。
 
 ## What it does
 
-| Event | Notification |
+| Event | Card |
 |---|---|
-| `session.idle` | **Generation completed** — your agent finished working |
-| `permission.ask` | **Permission requested** — your approval is needed |
-| `session.error` | **Session error occurred** — something went wrong |
+| `session.idle` | ✓ green — **任务完成** Task finished (shows session title when known) |
+| `permission.asked` | ⚠ amber — **等待授权** Your approval is needed |
+| `session.error` | ✕ red — **出错了** Something went wrong |
 
 Stop staring at the terminal while a long task runs — opencode will ping you on the desktop when it's done or needs you.
 
+## v3.0.0 — rewritten for the opencode v2 plugin format
+
+opencode 2.1+ requires plugins in the `plugins/` discovery directory to be **v2-format modules**: a default-exported definition object with an `id` and a `setup` (or `effect`) function. The old "export an async function returning hooks" format (and the old `plugin` config array with file paths) is no longer loaded — that is why this plugin silently stopped working for many users after upgrading opencode.
+
+v3 is a native v2 plugin:
+
+- default-exports `{ id: "user.win-notifier", setup }` — no helper imports needed, still zero dependencies
+- subscribes to the v2 event stream (`context.event.subscribe`)
+- handles both `properties`-shaped and `data`-shaped v2 events
+- subagent (child) sessions are filtered via `parentID`, rapid duplicate idles are debounced, unknown sessions still notify — prefer a stray popup over a missing one
+
 ## Install
 
-1. Put `index.js` anywhere you like, e.g. `~/.config/opencode/plugins-store/opencode-win-notifier/index.js`
-2. Reference it in your opencode config:
+1. Put `index.js` into the global plugin discovery directory, e.g.:
 
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "./plugins-store/opencode-win-notifier/index.js"
-  ]
-}
+```
+~/.config/opencode/plugins/win-notifier.js
 ```
 
-(Relative plugin paths resolve from the location of the `opencode.json` that declares them.)
+Windows example: `C:\Users\<you>\.config\opencode\plugins\win-notifier.js`
 
-3. Restart opencode. Done — no build, no npm install, nothing to configure.
+opencode discovers `.js`/`.ts` files in `~/.config/opencode/plugins/` automatically at startup — **no config entry needed**. (Editing the file hot-reloads the plugin; no restart required on opencode 2.1+.)
+
+2. Nothing else. No build, no npm install, no dependencies.
+
+> Note for opencode 1.x: use the v1/v2.0 tags of this repo with the old `plugin` config array instead.
 
 ## How it works
 
-- Registers opencode plugin hooks (`event` + `permission.ask`)
-- On trigger, spawns a **detached** `powershell.exe -NoProfile -EncodedCommand` process
+- Exports a v2 plugin definition; `setup` subscribes to the event stream
+- On trigger, spawns **detached** `powershell.exe -NoProfile -STA -EncodedCommand` processes:
+  - one running a WinRT toast via `ToastNotificationManager`
+  - one rendering the WPF card (`PresentationFramework`) with slide-in / fade-out animations and a `DispatcherTimer` countdown
 - The command is UTF-16LE → base64 encoded, so it is immune to quoting/injection issues
-- Inside PowerShell: a `System.Windows.Forms.NotifyIcon` balloon tip (surface as toast on Win10/11)
 - Fire-and-forget (`unref` + detached): never blocks the agent loop, never crashes the session
-
-## Why another notifier plugin?
-
-The opencode ecosystem already has two desktop-notification plugins — neither worked for me on Windows:
-
-- **`opencode-notifier` (npm, 0.2.2)** — fails to load under opencode 0.18.31's embedded runtime with `Invalid Date` (its bundled `bun:sqlite` analytics init; loads fine under standalone Bun 1.4.2, so it's a runtime-combination bug), and analytics can't be disabled before the crash point
-- **`opencode-notificator` (panta82, GitHub)** — no Windows branch, the notification functions only implement `darwin` (`osascript`) and `linux` (`notify-send`)
-
-So: 50 lines of transparent, dependency-free, Windows-only code. Nothing to trust but what you can read.
-
-## Security review checklist
-
-If you're the kind of person who reviews plugins before loading them (you should be):
-
-- [x] No dependencies — imports `node:child_process` only
-- [x] No network — no fetch/http/net/dns anywhere
-- [x] No disk writes, no env reads, no telemetry
-- [x] Child process only spawns `powershell.exe -NoProfile -EncodedCommand` with an internally-built script (title/message sanitized against single-quote injection)
-- [x] Everything is best-effort and wrapped in try/catch — notification failures can never break your session
+- Card text is passed as a single JSON blob (`ConvertFrom-Json`) — no string-injection surface
 
 ## Tuning
 
-Notification text is currently hardcoded ("Generation completed" etc.). Edit `index.js` directly — it's 50 lines, change whatever you like. Sound/timeout tweaks happen in the `ShowBalloonTip(...)` call.
+Top of the file:
+
+- `CARD_DURATION_MS` — how long the card stays on screen (default 6000)
+- `DEBOUNCE_MS` — merge duplicate idle events within this window (default 3000)
+- `CARDS` — title / message / glyph / accent color / sound per event type (notification text is Chinese by default; edit freely)
 
 ## Notes
 
-- Windows only (win32). On macOS/Linux you already have good options (see the two plugins above).
-- If no toast appears while dispatch succeeds: check Focus Assist / notification banners are enabled, and that *Windows PowerShell* isn't muted in Settings → System → Notifications.
+- Windows only (win32). On macOS/Linux you already have good options.
+- The card renders via WPF, so it works even when Focus Assist / notification banners are disabled; the toast companion requires Windows PowerShell not to be muted in Settings → System → Notifications.
+- Known limitation: simultaneous cards stack on top of each other (no cross-process positioning yet).
 
 ## License
 
